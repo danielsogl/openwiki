@@ -1094,7 +1094,18 @@ export function createModel(
       : { maxOutputTokens: configuredMaxOutputTokens };
   const streamIdleTimeoutOptions =
     streamIdleTimeout === undefined ? {} : { streamIdleTimeout };
-  const reasoningConfig = resolveReasoningConfig(provider, modelId);
+  const chatOpenAiUsesResponsesApi = providerUsesResponsesApi(
+    provider,
+    modelId,
+  );
+  const reasoningConfig = resolveReasoningConfig(
+    provider,
+    modelId,
+    process.env,
+    {
+      useResponsesApi: chatOpenAiUsesResponsesApi,
+    },
+  );
 
   // GPT-5.6 supports `max` before some OpenAI SDK type unions include it. The
   // documented Responses payload is still `reasoning: { effort }`, so keep the
@@ -1107,6 +1118,10 @@ export function createModel(
     reasoningConfig?.transport === "chat-completions-reasoning-effort"
       ? { modelKwargs: { reasoning_effort: reasoningConfig.effort } }
       : {};
+  const geminiThinkingLevelOptions =
+    reasoningConfig?.transport === "gemini-thinking-level"
+      ? { thinkingLevel: reasoningConfig.effort }
+      : {};
 
   if (provider === "gemini") {
     return new ChatGoogle({
@@ -1115,6 +1130,7 @@ export function createModel(
       platformType: "gai",
       // Gemini 3.x thought-signature round-trip; see the constant's comment.
       ...GEMINI_THOUGHT_SIGNATURE_OPTIONS,
+      ...geminiThinkingLevelOptions,
       ...googleMaxOutputTokensOptions,
       ...retryOptions,
     });
@@ -1234,7 +1250,7 @@ export function createModel(
         }
       : undefined,
     model: modelId,
-    useResponsesApi: providerUsesResponsesApi(provider, modelId),
+    useResponsesApi: chatOpenAiUsesResponsesApi,
     ...maxTokensOptions,
     ...responsesReasoningOptions,
     ...chatCompletionsReasoningOptions,
@@ -1439,6 +1455,10 @@ export function parseAgentStreamChunk(chunk: unknown): OpenWikiRunEvent | null {
     return parseToolStreamEvent(payload);
   }
 
+  if (mode === "updates") {
+    return parseUpdatesChunk(namespace, payload);
+  }
+
   const text = extractMessageText(payload);
 
   return text.length > 0
@@ -1489,14 +1509,43 @@ function isProtocolStreamEvent(value: unknown): value is ProtocolEvent {
 
 function isAgentStreamChunk(
   value: unknown,
-): value is [string[], "messages" | "tools", unknown] {
+): value is [string[], "messages" | "tools" | "updates", unknown] {
   return (
     Array.isArray(value) &&
     value.length === 3 &&
     Array.isArray(value[0]) &&
     value[0].every((part) => typeof part === "string") &&
-    (value[1] === "messages" || value[1] === "tools")
+    (value[1] === "messages" || value[1] === "tools" || value[1] === "updates")
   );
+}
+
+/**
+ * Extracts the last assistant text from an "updates" mode state-delta chunk.
+ * LangGraph "updates" chunks carry the per-node state diff rather than raw
+ * message tokens, so the payload is { nodeName: { messages: [...] }, ... }.
+ * We iterate the node outputs and return the first non-empty assistant text.
+ */
+function parseUpdatesChunk(
+  namespace: string[],
+  payload: unknown,
+): OpenWikiRunEvent | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  for (const nodeOutput of Object.values(payload)) {
+    const text = extractMessageText(nodeOutput);
+
+    if (text.length > 0) {
+      return {
+        source: getStreamSource(namespace),
+        type: "text",
+        text,
+      };
+    }
+  }
+
+  return null;
 }
 
 function extractMessageText(payload: unknown): string {
@@ -1805,12 +1854,23 @@ function parseToolStreamEvent(payload: unknown): OpenWikiRunEvent | null {
   return null;
 }
 
+const MODEL_REQUEST_NAMESPACE_PREFIX = "model_request:";
+
 /**
- * Classifies a stream namespace. LangGraph reserves the empty namespace for
- * the root graph; even a single namespace segment therefore belongs to a
- * subgraph.
+ * Classifies a stream namespace. DeepAgents wraps the primary model call in a
+ * single model_request namespace, while deeper namespaces still represent
+ * subgraphs whose prose should stay hidden from the main transcript.
  */
 function getStreamSource(namespace: unknown): "main" | "subgraph" {
+  if (
+    Array.isArray(namespace) &&
+    namespace.length === 1 &&
+    typeof namespace[0] === "string" &&
+    namespace[0].startsWith(MODEL_REQUEST_NAMESPACE_PREFIX)
+  ) {
+    return "main";
+  }
+
   return Array.isArray(namespace) && namespace.length > 0 ? "subgraph" : "main";
 }
 
@@ -1927,24 +1987,48 @@ type OpenRouterResponseSummary = {
 const OPENROUTER_DEBUG_PROPERTY = "openRouterDebug";
 const OPENROUTER_DEBUG_BODY_LIMIT = 4_000;
 
-function installOpenRouterDebugFetch(
-  options: OpenWikiRunOptions,
-): OpenRouterFetchCapture {
-  const originalFetch = globalThis.fetch;
-  let lastFailure: OpenRouterFetchFailure | null = null;
+/**
+ * Per-run sink for the most recent OpenRouter HTTP failure. Each run registers
+ * its own so concurrent runs don't share (or clobber) each other's captured
+ * failure. `ChatOpenRouter` (unlike the OpenAI/Codex/Vertex clients) extends
+ * `BaseChatModel` and calls `globalThis.fetch` directly with no injectable
+ * fetch, so a global wrapper is the only interception point — hence the
+ * reference-counted installer below rather than a per-model `configuration.fetch`.
+ */
+type OpenRouterFetchSink = {
+  lastFailure: OpenRouterFetchFailure | null;
+  options: OpenWikiRunOptions;
+};
 
-  globalThis.fetch = (async (input, init) => {
-    if (!isOpenRouterFetchInput(input)) {
-      return originalFetch(input, init);
+const activeOpenRouterSinks = new Set<OpenRouterFetchSink>();
+let openRouterOriginalFetch: typeof fetch | null = null;
+
+function openRouterDebugFetch(
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+): Promise<Response> {
+  // Captured when the wrapper was installed; the wrapper is only live while at
+  // least one sink is registered, so this is always set here.
+  const baseFetch = openRouterOriginalFetch ?? globalThis.fetch;
+
+  if (!isOpenRouterFetchInput(input)) {
+    return baseFetch(input, init);
+  }
+
+  const request = summarizeOpenRouterRequest(input, init);
+
+  const recordFailure = (failure: OpenRouterFetchFailure): void => {
+    for (const sink of activeOpenRouterSinks) {
+      sink.lastFailure = failure;
     }
+  };
 
-    const request = summarizeOpenRouterRequest(input, init);
-
+  return (async () => {
     try {
-      const response = await originalFetch(input, init);
+      const response = await baseFetch(input, init);
 
       if (!response.ok) {
-        lastFailure = {
+        const failure: OpenRouterFetchFailure = {
           request,
           response: {
             bodyPreview: await readResponseBodyPreview(response),
@@ -1953,31 +2037,63 @@ function installOpenRouterDebugFetch(
             statusText: response.statusText,
           },
         };
-        emitDebug(
-          options,
-          `openrouter.http status=${response.status} statusText=${JSON.stringify(
-            response.statusText,
-          )}`,
-        );
+        recordFailure(failure);
+        for (const sink of activeOpenRouterSinks) {
+          emitDebug(
+            sink.options,
+            `openrouter.http status=${response.status} statusText=${JSON.stringify(
+              response.statusText,
+            )}`,
+          );
+        }
       }
 
       return response;
     } catch (error) {
-      lastFailure = {
+      recordFailure({
         fetchError: error instanceof Error ? error.message : String(error),
         request,
-      };
+      });
       throw error;
     }
-  }) satisfies typeof fetch;
+  })();
+}
+
+/**
+ * Installs the reference-counted OpenRouter debug-fetch wrapper for one run and
+ * returns that run's capture handle. Exported for testing. Safe under
+ * concurrent runs: each caller gets an isolated failure sink and the global
+ * `fetch` is only restored once the last run detaches.
+ */
+export function installOpenRouterDebugFetch(
+  options: OpenWikiRunOptions,
+): OpenRouterFetchCapture {
+  const sink: OpenRouterFetchSink = { lastFailure: null, options };
+
+  // Install the wrapper once, capturing the genuine original fetch. Concurrent
+  // runs share the single wrapper and each detach their own sink; the global
+  // is only restored when the last run leaves, so overlapping install/restore
+  // can no longer leak or lose the patch.
+  if (activeOpenRouterSinks.size === 0) {
+    openRouterOriginalFetch = globalThis.fetch;
+    globalThis.fetch = openRouterDebugFetch;
+  }
+  activeOpenRouterSinks.add(sink);
 
   return {
     clearLastFailure: () => {
-      lastFailure = null;
+      sink.lastFailure = null;
     },
-    getLastFailure: () => lastFailure,
+    getLastFailure: () => sink.lastFailure,
     restore: () => {
-      globalThis.fetch = originalFetch;
+      if (!activeOpenRouterSinks.delete(sink)) {
+        return;
+      }
+
+      if (activeOpenRouterSinks.size === 0 && openRouterOriginalFetch) {
+        globalThis.fetch = openRouterOriginalFetch;
+        openRouterOriginalFetch = null;
+      }
     },
   };
 }
